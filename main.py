@@ -5,7 +5,7 @@ from typing import List, Optional
 
 import joblib
 import pandas as pd
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -25,6 +25,11 @@ FRONTEND_ORIGIN = "https://neurodetect-parkinson.netlify.app"
 FEATURE_COLUMNS = ["aX", "aY", "aZ", "gX", "gY", "gZ"]
 MAX_BATCH_SIZE = 20
 
+# RAM safety limit for ONE test (about 50 minutes at 20 samples/sec).
+# When the limit is reached, extra samples are still predicted
+# normally but are no longer stored for the website graph.
+MAX_SESSION_SAMPLES = 60000
+
 
 # =====================================================
 # 2. APP AND CORS
@@ -32,7 +37,7 @@ MAX_BATCH_SIZE = 20
 
 app = FastAPI(
     title="NeuroDetect Parkinson API",
-    version="4.1.0"
+    version="4.3.0"
 )
 
 app.add_middleware(
@@ -45,7 +50,7 @@ app.add_middleware(
 
 
 # =====================================================
-# 3. LOAD THE EXISTING MODEL
+# 3. LOAD THE EXISTING MODEL (NO RETRAINING)
 # =====================================================
 
 try:
@@ -67,6 +72,10 @@ state_lock = Lock()
 
 current_session_id = None
 latest_final_result = None
+
+# Sensor data of the CURRENT test only.
+# Cleared when a new session starts.
+sensor_history = []
 
 
 # =====================================================
@@ -159,7 +168,8 @@ def home():
             "/predict",
             "/predict/batch",
             "/session/start",
-            "/session/final-result"
+            "/session/final-result",
+            "/session/sensor-data"
         ]
     }
 
@@ -214,7 +224,11 @@ def predict_one(data: SensorData):
 
 # =====================================================
 # 10. ESP32 BATCH PREDICTION
-# Response remains {"predictions": [0, 1, ...]}
+# Response remains {"predictions": [0, 1, ...]}.
+# This endpoint NEVER rejects a batch because of session
+# state, so the existing ESP32 firmware behaves exactly
+# as before. Sensor data is additionally stored (RAM only)
+# for the website graphs.
 # =====================================================
 
 @app.post("/predict/batch")
@@ -225,6 +239,8 @@ def predict_batch(
         alias="X-API-Key"
     )
 ):
+    global current_session_id
+
     verify_device_key(x_api_key)
 
     if len(batch.samples) > MAX_BATCH_SIZE:
@@ -266,15 +282,43 @@ def predict_batch(
             detail="The model returned invalid predictions."
         )
 
-    # FSR is not an AI model input.
-    # This endpoint does not store sensor batches.
+    # Store sensor data for the website graphs.
+    # FSR is display-only; it is not a model feature.
+    with state_lock:
+        # If the server restarted in the middle of a test, it
+        # has forgotten the session. Re-adopt the ESP32's session
+        # so history and the final result keep working.
+        if current_session_id is None:
+            current_session_id = batch.session_id
+
+        if batch.session_id == current_session_id:
+            room = MAX_SESSION_SAMPLES - len(sensor_history)
+
+            if room > 0:
+                for sample, prediction in list(
+                    zip(batch.samples, predictions)
+                )[:room]:
+                    sensor_history.append({
+                        "timestamp_ms": sample.timestamp_ms,
+                        "aX": sample.aX,
+                        "aY": sample.aY,
+                        "aZ": sample.aZ,
+                        "gX": sample.gX,
+                        "gY": sample.gY,
+                        "gZ": sample.gZ,
+                        "fsr_raw": sample.fsr_raw,
+                        "prediction": prediction
+                    })
+
     return {"predictions": predictions}
 
 
 # =====================================================
 # 11. START A NEW SESSION
-# ESP32 must call this at the beginning of each test.
-# It clears the previous result to avoid showing stale data.
+# ESP32 calls this at the beginning of each test.
+# Clears the previous result AND previous sensor data,
+# unless the same session is simply being re-registered
+# (e.g. after a server restart) - then data is kept.
 # =====================================================
 
 @app.post("/session/start")
@@ -287,11 +331,14 @@ def start_session(
 ):
     verify_device_key(x_api_key)
 
-    global current_session_id, latest_final_result
+    global current_session_id, latest_final_result, sensor_history
 
     with state_lock:
+        if data.session_id != current_session_id:
+            sensor_history = []
+            latest_final_result = None
+
         current_session_id = data.session_id
-        latest_final_result = None
 
     return {
         "success": True,
@@ -363,9 +410,7 @@ def submit_final_result(
 
 # =====================================================
 # 13. WEBSITE READS THE LATEST FINAL RESULT
-# No API key is exposed to the browser.
-#
-# Always returns HTTP 200:
+# Always HTTP 200:
 #   {"status": "waiting"}              -> no result yet
 #   {"status": "ready", ...result...}  -> result available
 # =====================================================
@@ -377,3 +422,41 @@ def get_final_result():
             return {"status": "waiting"}
 
         return {"status": "ready", **latest_final_result}
+
+
+# =====================================================
+# 14. WEBSITE READS SENSOR DATA OF THE CURRENT TEST
+# (MPU6050 six values + FSR + prediction per sample)
+#
+# `since` = number of samples the website already has.
+# First call: since=0 (everything). Later calls: only new ones.
+# The website must compare `session_id`: when it changes, a new
+# test has started, so the old graph must be cleared and
+# `since` reset to 0.
+# =====================================================
+
+@app.get("/session/sensor-data")
+def get_sensor_data(
+    since: int = Query(default=0, ge=0)
+):
+    with state_lock:
+        if current_session_id is None:
+            return {
+                "status": "waiting",
+                "session_id": None,
+                "sample_count": 0,
+                "start_index": 0,
+                "samples": []
+            }
+
+        total = len(sensor_history)
+        start_index = min(since, total)
+
+        return {
+            "status": "ready",
+            "session_id": current_session_id,
+            "sample_count": total,
+            "start_index": start_index,
+            "samples": sensor_history[start_index:],
+            "history_limit": MAX_SESSION_SAMPLES
+        }
